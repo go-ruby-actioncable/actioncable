@@ -47,6 +47,71 @@ func TestConnection_ConnectWelcome(t *testing.T) {
 	}
 }
 
+func TestConnection_ConnectHookIdentifiesAndAuthorizes(t *testing.T) {
+	cap := &capture{}
+	srv := NewServer(NewAsyncAdapter())
+	conn := NewConnection(srv, cap.transport, nil).OnConnect(func(c *Connection) error {
+		c.IdentifiedBy("current_user", "alice")
+		return nil
+	})
+	if err := conn.Connect(); err != nil {
+		t.Fatalf("authorized connect returned error: %v", err)
+	}
+	if conn.Identifier("current_user") != "alice" {
+		t.Fatal("connect hook did not identify the connection")
+	}
+	if cap.last() != `{"type":"welcome"}` {
+		t.Fatalf("welcome not sent after authorized connect: %s", cap.last())
+	}
+	if conn.Closed() {
+		t.Fatal("authorized connection must stay open")
+	}
+}
+
+func TestConnection_RejectUnauthorized(t *testing.T) {
+	cap := &capture{}
+	srv := NewServer(NewAsyncAdapter())
+	conn := NewConnection(srv, cap.transport, nil).OnConnect(func(c *Connection) error {
+		return c.RejectUnauthorized()
+	})
+	err := conn.Connect()
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+	// The gem closes with reason "unauthorized", reconnect=false, and no welcome.
+	if cap.last() != `{"type":"disconnect","reason":"unauthorized","reconnect":false}` {
+		t.Fatalf("unauthorized disconnect frame: %s", cap.last())
+	}
+	for _, f := range cap.frames {
+		if f == `{"type":"welcome"}` {
+			t.Fatal("welcome must not be sent to a rejected connection")
+		}
+	}
+	if !conn.Closed() {
+		t.Fatal("rejected connection must be closed")
+	}
+}
+
+func TestConnection_ConnectHookNonAuthorizationError(t *testing.T) {
+	cap := &capture{}
+	srv := NewServer(NewAsyncAdapter())
+	boom := errors.New("db down")
+	conn := NewConnection(srv, cap.transport, nil).OnConnect(func(c *Connection) error {
+		return boom
+	})
+	err := conn.Connect()
+	if !errors.Is(err, boom) {
+		t.Fatalf("expected the hook's error, got %v", err)
+	}
+	// A non-authorization error neither closes the connection nor transmits.
+	if conn.Closed() {
+		t.Fatal("non-authorization error must not close the connection")
+	}
+	if len(cap.frames) != 0 {
+		t.Fatalf("non-authorization error must transmit nothing, got %v", cap.frames)
+	}
+}
+
 func TestConnection_SubscribeConfirmAndReceive(t *testing.T) {
 	cap := &capture{}
 	srv := NewServer(NewAsyncAdapter())
