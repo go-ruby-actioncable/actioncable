@@ -37,7 +37,7 @@ func TestEncodeMessage(t *testing.T) {
 	}
 }
 
-func TestEncodeMessage_NullAndNoHTMLEscape(t *testing.T) {
+func TestEncodeMessage_NullAndHTMLEscape(t *testing.T) {
 	got, err := EncodeMessage("id", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -45,13 +45,16 @@ func TestEncodeMessage_NullAndNoHTMLEscape(t *testing.T) {
 	if string(got) != `{"identifier":"id","message":null}` {
 		t.Errorf("nil message: %s", got)
 	}
-	// ActiveSupport::JSON leaves <, >, & intact by default.
+	// ActiveSupport::JSON with the default escape_html_entities_in_json = true
+	// escapes <, > and & as their \u00xx forms — the mode a real Action Cable
+	// server runs under — and so must this codec.
 	got, err = EncodeMessage("id", "<b>&</b>")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != `{"identifier":"id","message":"<b>&</b>"}` {
-		t.Errorf("html escape leaked: %s", got)
+	want := "{\"identifier\":\"id\",\"message\":\"\\u003cb\\u003e\\u0026\\u003c/b\\u003e\"}"
+	if string(got) != want {
+		t.Errorf("html not escaped like ActiveSupport::JSON:\n got %s\nwant %s", got, want)
 	}
 }
 

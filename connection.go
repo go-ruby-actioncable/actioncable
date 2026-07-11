@@ -2,9 +2,26 @@ package actioncable
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrUnauthorized is the sentinel a [ConnectHook] returns — directly or via
+// [Connection.RejectUnauthorized] — to reject a connection. It is the analogue of
+// ActionCable::Connection::Authorization::UnauthorizedError, which
+// reject_unauthorized_connection raises. When [Connection.Connect] sees it, the
+// connection is closed with the "unauthorized" reason and reconnect=false and no
+// welcome is sent, mirroring the gem's handle_open rescue.
+var ErrUnauthorized = errors.New("actioncable: unauthorized connection")
+
+// ConnectHook is the seam for a connection's app-defined connect method
+// (ActionCable::Connection::Base#connect), where identification and authorization
+// happen. It runs once, in [Connection.Connect], before the welcome frame. It
+// typically sets identified-by values via [Connection.IdentifiedBy] and may reject
+// the connection by returning [Connection.RejectUnauthorized] (or any error
+// wrapping [ErrUnauthorized]). May be nil (no connect method).
+type ConnectHook func(*Connection) error
 
 // Transport is the seam by which a [Connection] sends an encoded frame to the
 // client. The host (e.g. the rbgo binding) owns the actual WebSocket and plugs
@@ -25,6 +42,7 @@ type Connection struct {
 	server    *Server
 	transport Transport
 	factory   ChannelFactory
+	connect   ConnectHook
 
 	// Scheduler holds this connection's (and its channels') periodic timers,
 	// advanced deterministically by the host's event loop.
@@ -49,6 +67,20 @@ func NewConnection(server *Server, transport Transport, factory ChannelFactory) 
 	}
 }
 
+// OnConnect installs the connection's connect method (see [ConnectHook]),
+// returning the connection so it can be chained after [NewConnection]. It mirrors
+// defining #connect on an ActionCable::Connection::Base subclass.
+func (c *Connection) OnConnect(hook ConnectHook) *Connection {
+	c.connect = hook
+	return c
+}
+
+// RejectUnauthorized rejects the connection, mirroring
+// reject_unauthorized_connection: it returns [ErrUnauthorized], which a
+// [ConnectHook] returns to make [Connection.Connect] close the connection with the
+// "unauthorized" reason and reconnect=false without sending a welcome frame.
+func (c *Connection) RejectUnauthorized() error { return ErrUnauthorized }
+
 // IdentifiedBy sets an identified-by key (e.g. current_user) for the connection.
 func (c *Connection) IdentifiedBy(key string, value any) { c.identifiers[key] = value }
 
@@ -60,12 +92,29 @@ func (c *Connection) Closed() bool { return c.closed }
 
 func (c *Connection) transmit(payload []byte) { c.transport(payload) }
 
-// Connect performs the open handshake: it transmits the welcome frame and
-// subscribes to this connection's internal channel so RemoteConnections can
-// reach it.
-func (c *Connection) Connect() {
-	c.transmit(EncodeWelcome())
+// Connect performs the open handshake, mirroring the gem's handle_open: it runs
+// the connect method (if any) for identification/authorization, subscribes to this
+// connection's internal channel so RemoteConnections can reach it, then transmits
+// the welcome frame.
+//
+// If the connect hook rejects the connection by returning [ErrUnauthorized] (e.g.
+// via [Connection.RejectUnauthorized]), Connect closes the connection with the
+// "unauthorized" reason and reconnect=false, sends no welcome, and returns the
+// error — the analogue of handle_open rescuing UnauthorizedError. Any other error
+// from the hook is returned without sending a welcome and without closing (the host
+// decides), leaving the transport untouched.
+func (c *Connection) Connect() error {
+	if c.connect != nil {
+		if err := c.connect(c); err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				c.close(DisconnectUnauthorized, false)
+			}
+			return err
+		}
+	}
 	c.subscribeInternal()
+	c.transmit(EncodeWelcome())
+	return nil
 }
 
 func (c *Connection) subscribeInternal() {

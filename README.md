@@ -23,22 +23,28 @@ It is the Action Cable backend for
 [go-ruby-redis](https://github.com/go-ruby-redis/redis) and
 [go-ruby-activesupport](https://github.com/go-ruby-activesupport/activesupport).
 
-## The two host-owned seams
+## The host-owned seams
 
 Everything that is *not* protocol logic is left as an injectable seam, so the
 host (the rbgo binding) owns it:
 
 | Seam | Type | What the host plugs in |
 |------|------|------------------------|
-| **Transport** | `func(payload []byte)` | the WebSocket write — a `Connection` transmits a ready-to-send JSON frame through it |
+| **Transport** | `func(payload []byte)` | the WebSocket write — a `Connection` transmits a ready-to-send JSON frame through it. A **real pure-Go WebSocket transport** ([`Handler`](#websocket-transport) / [`Upgrade`](#websocket-transport)) ships here as the concrete fill; the host may still inject its own |
+| **ConnectHook** | `func(*Connection) error` | the connection's `connect` method — identification (`identified_by`) and authorization; return [`RejectUnauthorized`](#connection-authorization) to reject |
 | **ChannelAction** | `func(channel, action string, data any) any` | the channel's Ruby method bodies — `subscribed` / `unsubscribed` / `receive` / custom actions. The binding builds the closure capturing the `*Channel`, so a body can call `StreamFrom` / `Reject` / `Transmit` on it |
 | **Adapter** | `interface{ Broadcast; Subscribe }` | the pub-sub backend — [`AsyncAdapter`](#pub-sub-adapters) (in-process) and [`RedisAdapter`](#pub-sub-adapters) ship here |
 
 ## Wire-protocol fidelity
 
 The JSON envelopes are byte-faithful to Action Cable's `actioncable-v1-json`
-protocol. Key order matters and is fixed per frame (dedicated structs, HTML
-escaping disabled to match `ActiveSupport::JSON`):
+protocol. Key order matters and is fixed per frame (dedicated structs), and
+HTML-significant bytes are escaped exactly as `ActiveSupport::JSON` does under its
+default `escape_html_entities_in_json = true` — `<`, `>`, `&` become `<`,
+`>`, `&` and the JS line separators `U+2028` / `U+2029` become
+` ` / ` ` — the mode a real Rails Action Cable server runs under. Every
+frame below and every name derivation is checked **byte-for-byte against the real
+MRI `actioncable` gem** by the differential [oracle test](#oracle-differential-test-vs-the-gem):
 
 | Direction | Frame | Bytes |
 |-----------|-------|-------|
@@ -103,6 +109,55 @@ func main() {
 }
 ```
 
+## Connection authorization
+
+The connection's `connect` method — where `identified_by` and authorization live —
+is the `ConnectHook` seam, installed with `OnConnect`. It runs once, at
+`Connect`, before the welcome frame. Returning `RejectUnauthorized()` (the analogue
+of `reject_unauthorized_connection` raising `UnauthorizedError`) closes the
+connection with the `unauthorized` reason and `reconnect:false` and sends **no**
+welcome — exactly as the gem's `handle_open` rescue does:
+
+```go
+conn := actioncable.NewConnection(server, transport, factory).
+	OnConnect(func(c *actioncable.Connection) error {
+		user := authenticate(c) // your cookie / token logic
+		if user == "" {
+			return c.RejectUnauthorized()
+		}
+		c.IdentifiedBy("current_user", user) // identified_by :current_user
+		return nil
+	})
+
+err := conn.Connect()
+// authorized:   -> {"type":"welcome"}                                        (err == nil)
+// unauthorized: -> {"type":"disconnect","reason":"unauthorized","reconnect":false}
+//                  errors.Is(err, actioncable.ErrUnauthorized) == true
+```
+
+## WebSocket transport
+
+A real, **pure-Go (no cgo, no third-party dependency)** WebSocket transport ships
+for the `/cable` endpoint: `Handler` performs the RFC 6455 server handshake,
+negotiates the `actioncable-v1-json` sub-protocol, and drives a `Connection` — a
+real Action Cable JavaScript client interoperates with it unchanged. It is the
+concrete fill for the `Transport` seam; a host wanting its own may keep using
+`NewConnection` with a custom `Transport`.
+
+```go
+mux := http.NewServeMux()
+mux.Handle("/cable", actioncable.Handler(server, factory, &actioncable.CableOptions{
+	OnConnect:    authorize,          // the ConnectHook above
+	PingInterval: 3 * time.Second,    // protocol-level heartbeat
+}))
+http.ListenAndServe(":28080", mux)
+```
+
+`Upgrade(w, r) (*WSConn, error)` is exposed for hosts that want the handshake
+without the drive loop. Only the subset Action Cable needs is implemented
+(unfragmented text frames, ping/pong, close); client frames are required to be
+masked and server frames are sent unmasked, per RFC 6455.
+
 ## Pub-sub adapters
 
 `Server.Broadcast(broadcasting, data)` JSON-encodes `data` and fans it out to
@@ -147,13 +202,22 @@ func (s *Server) RemoteConnections() *RemoteConnections
 // Connection
 type Transport func(payload []byte)
 type ChannelFactory func(*Connection, string, map[string]any) (*Channel, bool)
+type ConnectHook func(*Connection) error
+var ErrUnauthorized error
 func NewConnection(server *Server, transport Transport, factory ChannelFactory) *Connection
-func (c *Connection) Connect()
-func (c *Connection) Dispatch(raw []byte) error          // subscribe/unsubscribe/message
-func (c *Connection) Beat(epoch int64)                   // ping
-func (c *Connection) Advance(d time.Duration)            // fire due periodic timers
+func (c *Connection) OnConnect(hook ConnectHook) *Connection  // connect method seam
+func (c *Connection) RejectUnauthorized() error              // reject_unauthorized_connection
+func (c *Connection) Connect() error                         // connect hook + welcome
+func (c *Connection) Dispatch(raw []byte) error              // subscribe/unsubscribe/message
+func (c *Connection) Beat(epoch int64)                       // ping
+func (c *Connection) Advance(d time.Duration)                // fire due periodic timers
 func (c *Connection) Disconnect(reason string, reconnect bool)
-func (c *Connection) IdentifiedBy(key string, value any) // identified_by
+func (c *Connection) IdentifiedBy(key string, value any)     // identified_by
+
+// WebSocket transport (pure-Go RFC 6455, /cable)
+type CableOptions struct { OnConnect ConnectHook; PingInterval time.Duration }
+func Handler(server *Server, factory ChannelFactory, opts *CableOptions) http.Handler
+func Upgrade(w http.ResponseWriter, r *http.Request) (*WSConn, error)
 
 // Channel
 type ChannelAction func(channel, action string, data any) any
@@ -171,16 +235,28 @@ func SerializeBroadcasting(objects ...any) string
 func ChannelName(className string) string
 ```
 
-## Roadmap (deferred from v0.1)
+## Oracle: differential test vs the gem
 
-v0.1 is the **protocol core + pub-sub**. The transport and the channel bodies are
-seams by design. Deferred, in rough order:
+`testdata/oracle.rb` runs the real MRI `actioncable` gem and emits the exact bytes
+it produces for every wire frame and every name derivation; `oracle_test.go`
+computes each case through the Go API and asserts **byte-for-byte** equality, so the
+gem is the ground truth for the on-the-wire protocol. The oracle skips itself where
+ruby or the gem is absent (Windows, qemu, no-gem machines), and the deterministic
+ruby-free tests alone keep coverage at 100% on those lanes. Running it against
+`actioncable 8.0.2` is what pinned the HTML-entity escaping (`ActiveSupport::JSON`'s
+default `escape_html_entities_in_json = true`) and the acronym-boundary
+`channel_name` rule (`HTTPServerChannel` → `http_server`).
 
-- **WebSocket server / handshake** — the actual `/cable` HTTP upgrade, sub-protocol
-  negotiation and framing. Today `Transport` is the seam the host drives.
+## Roadmap (still deferred)
+
+The protocol core, pub-sub, connection authorization and the `/cable` WebSocket
+transport are implemented. The channel bodies stay a seam by design. Deferred, in
+rough order:
+
 - **Rails engine mount** — routing, `config.action_cable.*`, `cable.yml`.
-- **Authorization** — cookies / Warden / Devise integration in `connect`,
-  `reject_unauthorized_connection`.
+- **Request-origin / CSRF checks** — `allow_request_origin?`,
+  `disable_request_forgery_protection`, cookie / Warden / Devise plumbing (the
+  `ConnectHook` seam is where a host wires these today).
 - **Instrumentation** — `ActiveSupport::Notifications` events, logging tags.
 - **Full RemoteConnections** — beyond the internal-channel disconnect modeled here.
 - **go-ruby-redis wiring** — a ready-made `RedisPubSub` adapter over go-ruby-redis

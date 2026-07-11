@@ -53,31 +53,52 @@ func BroadcastingName(channelName string, model any) string {
 }
 
 // ChannelName derives a channel's broadcasting-name component from its Ruby
-// class name, mirroring ActionCable::Channel::Base.channel_name:
-// name.sub(/Channel$/, "").gsub("::", ":").underscore.
+// class name, mirroring ActionCable::Channel::Naming#channel_name:
+// name.delete_suffix("Channel").gsub("::", ":").underscore.
 //
-//	"ChatChannel"       -> "chat"
-//	"Chat::RoomChannel" -> "chat:room"
-//	"AdminNotifications"-> "admin_notifications"
+//	"ChatChannel"                     -> "chat"
+//	"Chat::RoomChannel"               -> "chat:room"
+//	"AdminNotificationsChannel"       -> "admin_notifications"
+//	"FooChats::BarAppearancesChannel" -> "foo_chats:bar_appearances"
+//	"HTTPServerChannel"               -> "http_server"
 func ChannelName(className string) string {
 	s := strings.TrimSuffix(className, "Channel")
 	s = strings.ReplaceAll(s, "::", ":")
 	return underscore(s)
 }
 
-// underscore lower-cases and inserts "_" at camel-hump boundaries, matching the
-// relevant part of ActiveSupport's String#underscore for ASCII class names.
+// underscore lower-cases and inserts "_" at word boundaries the way ActiveSupport's
+// String#underscore does for ASCII class names, implementing both of its
+// substitutions: the acronym boundary /([A-Z\d]+)([A-Z][a-z])/ (so "HTTPServer" ->
+// "http_server") and the camel-hump boundary /([a-z\d])([A-Z])/ (so
+// "AdminNotifications" -> "admin_notifications"); "-" becomes "_". Non-letter
+// separators such as the ":" left by the "::" replacement pass through untouched.
 func underscore(s string) string {
+	isUpper := func(c byte) bool { return c >= 'A' && c <= 'Z' }
+	isLower := func(c byte) bool { return c >= 'a' && c <= 'z' }
+	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
+
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			if i > 0 {
-				prev := s[i-1]
-				if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') {
-					b.WriteByte('_')
-				}
+		if c == '-' {
+			b.WriteByte('_')
+			continue
+		}
+		if isUpper(c) && i > 0 {
+			prev := s[i-1]
+			var next byte
+			if i+1 < len(s) {
+				next = s[i+1]
 			}
+			switch {
+			case isLower(prev) || isDigit(prev): // /([a-z\d])([A-Z])/
+				b.WriteByte('_')
+			case isUpper(prev) && isLower(next): // /([A-Z\d]+)([A-Z][a-z])/
+				b.WriteByte('_')
+			}
+		}
+		if isUpper(c) {
 			b.WriteByte(c - 'A' + 'a')
 		} else {
 			b.WriteByte(c)

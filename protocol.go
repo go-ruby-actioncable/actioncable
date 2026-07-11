@@ -101,13 +101,20 @@ type disconnectFrame struct {
 	Reconnect bool   `json:"reconnect"`
 }
 
-// encodeJSON encodes v with HTML escaping disabled — matching the default of
-// ActiveSupport::JSON (ActionCable's default coder), where "<", ">" and "&" are
-// left intact — and strips the trailing newline the encoder appends.
+// encodeJSON encodes v the way ActionCable's default coder (ActiveSupport::JSON)
+// does with its default escape_html_entities_in_json = true: the HTML-significant
+// bytes "<", ">" and "&" are emitted as the < / > / & escapes, and
+// the JS line separators U+2028 / U+2029 as   /  . Go's encoder does
+// exactly this with HTML escaping on (the default), so a real Action Cable
+// JavaScript client receives byte-identical frames. The trailing newline the
+// encoder appends is stripped.
+//
+// This matches ActiveSupport::JSON::Encoding::ESCAPED_CHARS with the global
+// escape_html_entities_in_json flag, which defaults to true in Rails and in bare
+// ActiveSupport alike — the mode a real Rails Action Cable server runs under.
 func encodeJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
